@@ -29,7 +29,11 @@ class UCClient:
         try:
             with urlopen(req, timeout=60) as r:
                 result = json.loads(r.read().decode('utf-8', 'replace'))
-        except (HTTPError, URLError, TimeoutError) as e:
+        except HTTPError as e:
+            try: detail = e.read().decode('utf-8', 'replace')
+            except Exception: detail = ''
+            raise RuntimeError(f'接口请求失败: HTTP {e.code} {detail[:500]}')
+        except (URLError, TimeoutError) as e:
             raise RuntimeError(f'接口请求失败: {e}')
         if result.get('code', 0) not in (0, '0') and result.get('status', 200) not in (200, '200'):
             raise RuntimeError(f'接口返回错误: {result}')
@@ -148,7 +152,7 @@ class UCClient:
     def _upload_parts(self, path, mime, info):
         bucket, obj_key, upload_id = info['bucket'], info['obj_key'], info['upload_id']
         auth_info, task = info['auth_info'], info['task_id']
-        part_size = int((info.get('metadata') or {}).get('part_size') or 4 * 1024 * 1024)
+        part_size = max(int((info.get('metadata') or {}).get('part_size') or 8 * 1024 * 1024), 8 * 1024 * 1024)
         base = info.get('upload_url', '')
         if not base: raise RuntimeError('接口没有返回 upload_url')
         if not base.startswith('http'): base = 'https://' + base
