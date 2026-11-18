@@ -33,7 +33,7 @@ class UCClient:
             raise RuntimeError(f'接口返回错误: {result}')
         return result
 
-    def upload(self, path, parent_id):
+    def upload(self, path, parent_id, make_share=True):
         size = os.path.getsize(path)
         name = os.path.basename(path)
         mime = mimetypes.guess_type(name)[0] or 'application/octet-stream'
@@ -56,22 +56,53 @@ class UCClient:
         if (hashed.get('data') or {}).get('finish'):
             self.progress(100); self.log('秒传成功')
             fid = self._extract_fid(hashed) or self._find_uploaded_fid(parent_id, name)
-            if fid:
+            if fid and make_share:
                 link = self.create_share(fid, name)
                 self.log('永久分享链接: ' + link)
                 return link
-            return
+            return fid
         self._upload_parts(path, mime, info)
         finished = self.request_json('POST', '/file/upload/finish', {'task_id': task, 'obj_key': info.get('obj_key')})
         self.progress(100); self.log('上传完成')
         fid = self._extract_fid(finished)
         if not fid:
             fid = self._find_uploaded_fid(parent_id, name)
-        if fid:
+        if fid and make_share:
             link = self.create_share(fid, name)
             self.log('永久分享链接: ' + link)
             return link
-        self.log('上传完成，但未能定位文件ID，未生成分享链接')
+        return fid
+
+    def create_folder(self, parent_id, name):
+        result = self.request_json('POST', '/file', {'pdir_fid': parent_id, 'file_name': name, 'dir_init_lock': False})
+        data = result.get('data') or {}
+        fid = data.get('fid') or (data.get('file') or {}).get('fid')
+        if not fid:
+            raise RuntimeError(f'创建文件夹失败: {result}')
+        self.log('已创建文件夹: ' + name)
+        return fid
+
+    def upload_folder(self, folder, parent_id):
+        folder = os.path.abspath(folder)
+        root_name = os.path.basename(folder.rstrip(os.sep)) or '上传文件夹'
+        root_fid = self.create_folder(parent_id, root_name)
+        folders = {folder: root_fid}
+        files = []
+        for current, dirs, names in os.walk(folder):
+            dirs.sort(); names.sort()
+            for d in dirs:
+                child = os.path.join(current, d)
+                folders[child] = self.create_folder(folders[current], d)
+            for name in names:
+                files.append(os.path.join(current, name))
+        total = len(files)
+        self.log(f'文件夹共 {total} 个文件，开始上传')
+        for index, path in enumerate(files, 1):
+            self.log(f'[{index}/{total}] ' + os.path.basename(path))
+            self.upload(path, folders[os.path.dirname(path)], make_share=False)
+        link = self.create_share(root_fid, root_name)
+        self.log('永久文件夹分享链接: ' + link)
+        return link
 
     def _extract_fid(self, result):
         data = result.get('data') or {}
@@ -147,19 +178,24 @@ class UCClient:
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('UC网盘文件上传'); self.geometry('620x520'); self.resizable(False, False)
-        self.file = tk.StringVar(); self.parent = tk.StringVar(value='0')
+        self.file = tk.StringVar(); self.parent = tk.StringVar(value='0'); self.mode = tk.StringVar(value='file')
         ttk.Label(self, text='UC网盘 Cookie（只在本机使用）').pack(anchor='w', padx=14, pady=(12,3))
         self.cookie = tk.Text(self, height=4, width=78); self.cookie.pack(padx=14)
         row = ttk.Frame(self); row.pack(fill='x', padx=14, pady=10)
         ttk.Label(row, text='目标文件夹 ID').pack(side='left'); ttk.Entry(row, textvariable=self.parent, width=24).pack(side='left', padx=8)
-        ttk.Button(self, text='选择文件', command=self.choose).pack(anchor='w', padx=14)
+        buttons = ttk.Frame(self); buttons.pack(anchor='w', padx=14)
+        ttk.Button(buttons, text='选择文件', command=self.choose).pack(side='left')
+        ttk.Button(buttons, text='选择文件夹', command=self.choose_folder).pack(side='left', padx=8)
         ttk.Entry(self, textvariable=self.file, width=78).pack(padx=14, pady=6)
         self.bar = ttk.Progressbar(self, length=590, mode='determinate'); self.bar.pack(padx=14, pady=8)
         self.start = ttk.Button(self, text='开始上传', command=self.start_upload); self.start.pack(pady=4)
         self.logbox = tk.Text(self, height=14, width=78, state='disabled'); self.logbox.pack(padx=14, pady=8)
     def choose(self):
         p = filedialog.askopenfilename();
-        if p: self.file.set(p)
+        if p: self.file.set(p); self.mode.set('file')
+    def choose_folder(self):
+        p = filedialog.askdirectory();
+        if p: self.file.set(p); self.mode.set('folder')
     def log(self, s): self.after(0, lambda: (self.logbox.configure(state='normal'), self.logbox.insert('end', s+'\n'), self.logbox.see('end'), self.logbox.configure(state='disabled')))
     def progress(self, n): self.after(0, lambda: self.bar.configure(value=n))
     def start_upload(self):
@@ -167,7 +203,10 @@ class App(tk.Tk):
         if not cookie or not path: return messagebox.showwarning('提示','请填写 Cookie 并选择文件')
         self.start.configure(state='disabled'); self.bar['value'] = 0
         def run():
-            try: UCClient(cookie, self.log, self.progress).upload(path, parent)
+            try:
+                client = UCClient(cookie, self.log, self.progress)
+                if self.mode.get() == 'folder': client.upload_folder(path, parent)
+                else: client.upload(path, parent)
             except Exception as e: self.log('失败: ' + str(e)); self.after(0, lambda: messagebox.showerror('上传失败', str(e)))
             finally: self.after(0, lambda: self.start.configure(state='normal'))
         threading.Thread(target=run, daemon=True).start()
