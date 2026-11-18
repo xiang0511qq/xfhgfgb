@@ -1,4 +1,4 @@
-import base64, hashlib, json, mimetypes, os, threading, time, tkinter as tk
+import base64, hashlib, json, mimetypes, os, struct, threading, time, tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -149,6 +149,38 @@ class UCClient:
             raise RuntimeError('没有获取到分享链接')
         return url
 
+    def _hash_contexts(self, path, part_size):
+        # 计算 OSS/PDS 要求的 SHA1 中间状态。第一个分片不带 ctx，后续分片使用前一分片结束状态。
+        h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0]
+        tail = b''; contexts = []; total = 0; next_boundary = part_size
+        def process(block):
+            nonlocal h
+            w = list(struct.unpack('>16I', block))
+            for i in range(16, 80):
+                v = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]
+                w.append(((v << 1) | (v >> 31)) & 0xffffffff)
+            a,b,c,d,e = h
+            for i in range(80):
+                if i < 20: f = (b & c) | ((~b) & d); k = 0x5A827999
+                elif i < 40: f = b ^ c ^ d; k = 0x6ED9EBA1
+                elif i < 60: f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC
+                else: f = b ^ c ^ d; k = 0xCA62C1D6
+                t = (((a << 5) | (a >> 27)) + f + e + k + w[i]) & 0xffffffff
+                e,d,c,b,a = d,c,((b << 30) | (b >> 2)) & 0xffffffff,a,t
+            h = [(h[0]+a)&0xffffffff,(h[1]+b)&0xffffffff,(h[2]+c)&0xffffffff,(h[3]+d)&0xffffffff,(h[4]+e)&0xffffffff]
+        with open(path, 'rb') as f:
+            while chunk := f.read(1024 * 1024):
+                total += len(chunk)
+                data = tail + chunk
+                full = len(data) - (len(data) % 64)
+                for pos in range(0, full, 64): process(data[pos:pos+64])
+                tail = data[full:]
+                while total >= next_boundary:
+                    obj = {'hash_type':'sha1','h0':str(h[0]),'h1':str(h[1]),'h2':str(h[2]),'h3':str(h[3]),'h4':str(h[4]),'Nl':str(next_boundary*8),'Nh':'0','data':'','num':'0'}
+                    contexts.append(base64.b64encode(json.dumps(obj,separators=(',',':')).encode()).decode())
+                    next_boundary += part_size
+        return contexts
+
     def _upload_parts(self, path, mime, info):
         bucket, obj_key, upload_id = info['bucket'], info['obj_key'], info['upload_id']
         auth_info, task = info['auth_info'], info['task_id']
@@ -163,18 +195,21 @@ class UCClient:
         oss = base + '/' + obj_key.lstrip('/')
         total = max(1, (os.path.getsize(path) + part_size - 1) // part_size)
         etags = []
+        hash_contexts = self._hash_contexts(path, part_size)
         with open(path, 'rb') as f:
             for number in range(1, total + 1):
                 block = f.read(part_size)
                 date = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
-                meta = f'PUT\n\n{mime}\n{date}\nx-oss-date:{date}\nx-oss-user-agent:aliyun-sdk-js/6.6.1\n/{bucket}/{obj_key}?partNumber={number}&uploadId={upload_id}'
+                hash_ctx = hash_contexts[number - 2] if number >= 2 and number - 2 < len(hash_contexts) else ''
+                hash_line = f'x-oss-hash-ctx:{hash_ctx}\n' if hash_ctx else ''
+                meta = f'PUT\n\n{mime}\n{date}\nx-oss-date:{date}\n{hash_line}x-oss-user-agent:aliyun-sdk-js/6.6.1\n/{bucket}/{obj_key}?partNumber={number}&uploadId={upload_id}'
                 auth = self.request_json('POST', '/file/upload/auth', {'task_id': task, 'auth_info': auth_info, 'auth_meta': meta})
                 key = (auth.get('data') or {}).get('auth_key')
                 if not key: raise RuntimeError(f'获取分片授权失败: {auth}')
                 q = urlencode({'partNumber': number, 'uploadId': upload_id})
                 req = Request(oss + '?' + q, data=block, method='PUT', headers={
                     'User-Agent': UA, 'Content-Type': mime, 'Authorization': key,
-                    'x-oss-date': date, 'x-oss-user-agent': 'aliyun-sdk-js/6.6.1'})
+                    'x-oss-date': date, 'x-oss-user-agent': 'aliyun-sdk-js/6.6.1', **({'X-Oss-Hash-Ctx': hash_ctx} if hash_ctx else {})})
                 with urlopen(req, timeout=180) as response:
                     etags.append(response.headers.get('ETag', '').strip('"'))
                 self.progress(number * 100 / total); self.log(f'已上传分片 {number}/{total}')
