@@ -16,8 +16,10 @@ class UCClient:
         self.headers = {'User-Agent': UA, 'Accept': 'application/json, text/plain, */*',
                         'Origin': ORIGIN, 'Referer': ORIGIN + '/', 'Cookie': self.cookie}
 
-    def request_json(self, method, path, data=None):
-        query = urlencode({'pr': 'UCBrowser', 'fr': 'pc'})
+    def request_json(self, method, path, data=None, params=None):
+        query_data = {'pr': 'UCBrowser', 'fr': 'pc'}
+        if params: query_data.update(params)
+        query = urlencode(query_data)
         url = f'{API}{path}?{query}'
         body = None if data is None else json.dumps(data).encode()
         headers = dict(self.headers)
@@ -122,7 +124,18 @@ class UCClient:
     def create_share(self, fid, title):
         result = self.request_json('POST', '/share', {'fid_list': [fid], 'title': title, 'url_type': 1, 'expired_type': 1})
         data = result.get('data') or {}
-        share_id = data.get('share_id') or ((data.get('task_resp') or {}).get('data') or {}).get('share_id')
+        task_resp = data.get('task_resp') or {}
+        task_data = task_resp.get('data') or {}
+        share_id = data.get('share_id') or task_data.get('share_id')
+        task_id = data.get('task_id') or task_data.get('task_id')
+        if not share_id and task_id:
+            self.log('分享任务已创建，等待 UC 返回分享ID')
+            for retry in range(12):
+                time.sleep(0.6)
+                task = self.request_json('GET', '/task', params={'task_id': task_id, 'retry_index': retry})
+                td = task.get('data') or {}
+                share_id = td.get('share_id') or ((td.get('task_resp') or {}).get('data') or {}).get('share_id')
+                if share_id: break
         if not share_id:
             raise RuntimeError('分享创建成功但没有返回分享ID')
         detail = self.request_json('POST', '/share/password', {'share_id': share_id})
