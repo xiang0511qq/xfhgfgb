@@ -50,7 +50,7 @@ class UCClient:
                 md5.update(chunk); sha1.update(chunk)
         now = int(time.time() * 1000)
         pre = self.request_json('POST', '/file/upload/pre', {
-            'ccp_hash_update': True, 'parallel_upload': True, 'pdir_fid': parent_id,
+            'ccp_hash_update': True, 'parallel_upload': False, 'pdir_fid': parent_id,
             'dir_name': '', 'file_name': name, 'format_type': mime,
             'l_created_at': now, 'l_updated_at': now, 'size': size
         })
@@ -195,21 +195,18 @@ class UCClient:
         oss = base + '/' + obj_key.lstrip('/')
         total = max(1, (os.path.getsize(path) + part_size - 1) // part_size)
         etags = []
-        hash_contexts = self._hash_contexts(path, part_size)
         with open(path, 'rb') as f:
             for number in range(1, total + 1):
                 block = f.read(part_size)
                 date = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())
-                hash_ctx = hash_contexts[number - 2] if number >= 2 and number - 2 < len(hash_contexts) else ''
-                hash_line = f'x-oss-hash-ctx:{hash_ctx}\n' if hash_ctx else ''
-                meta = f'PUT\n\n{mime}\n{date}\nx-oss-date:{date}\n{hash_line}x-oss-user-agent:aliyun-sdk-js/6.6.1\n/{bucket}/{obj_key}?partNumber={number}&uploadId={upload_id}'
+                meta = f'PUT\n\n{mime}\n{date}\nx-oss-date:{date}\nx-oss-user-agent:aliyun-sdk-js/6.6.1\n/{bucket}/{obj_key}?partNumber={number}&uploadId={upload_id}'
                 auth = self.request_json('POST', '/file/upload/auth', {'task_id': task, 'auth_info': auth_info, 'auth_meta': meta})
                 key = (auth.get('data') or {}).get('auth_key')
                 if not key: raise RuntimeError(f'获取分片授权失败: {auth}')
                 q = urlencode({'partNumber': number, 'uploadId': upload_id})
                 req = Request(oss + '?' + q, data=block, method='PUT', headers={
                     'User-Agent': UA, 'Content-Type': mime, 'Authorization': key,
-                    'x-oss-date': date, 'x-oss-user-agent': 'aliyun-sdk-js/6.6.1', **({'X-Oss-Hash-Ctx': hash_ctx} if hash_ctx else {})})
+                    'x-oss-date': date, 'x-oss-user-agent': 'aliyun-sdk-js/6.6.1'})
                 with urlopen(req, timeout=180) as response:
                     etags.append(response.headers.get('ETag', '').strip('"'))
                 self.progress(number * 100 / total); self.log(f'已上传分片 {number}/{total}')
