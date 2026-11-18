@@ -54,10 +54,52 @@ class UCClient:
         self.log('预上传成功，正在校验哈希')
         hashed = self.request_json('POST', '/file/update/hash', {'task_id': task, 'md5': md5.hexdigest(), 'sha1': sha1.hexdigest()})
         if (hashed.get('data') or {}).get('finish'):
-            self.progress(100); self.log('秒传成功'); return
+            self.progress(100); self.log('秒传成功')
+            fid = self._extract_fid(hashed) or self._find_uploaded_fid(parent_id, name)
+            if fid:
+                link = self.create_share(fid, name)
+                self.log('永久分享链接: ' + link)
+                return link
+            return
         self._upload_parts(path, mime, info)
-        self.request_json('POST', '/file/upload/finish', {'task_id': task, 'obj_key': info.get('obj_key')})
+        finished = self.request_json('POST', '/file/upload/finish', {'task_id': task, 'obj_key': info.get('obj_key')})
         self.progress(100); self.log('上传完成')
+        fid = self._extract_fid(finished)
+        if not fid:
+            fid = self._find_uploaded_fid(parent_id, name)
+        if fid:
+            link = self.create_share(fid, name)
+            self.log('永久分享链接: ' + link)
+            return link
+        self.log('上传完成，但未能定位文件ID，未生成分享链接')
+
+    def _extract_fid(self, result):
+        data = result.get('data') or {}
+        for obj in (data, data.get('file') or {}, data.get('task_resp') or {}, (data.get('task_resp') or {}).get('data') or {}):
+            if obj.get('fid'):
+                return obj['fid']
+        return None
+
+    def _find_uploaded_fid(self, parent_id, name):
+        result = self.request_json('GET', '/file/sort', None)
+        items = (result.get('data') or {}).get('list') or []
+        for item in items:
+            if item.get('pdir_fid') == parent_id and item.get('file_name') == name:
+                return item.get('fid')
+        return None
+
+    def create_share(self, fid, title):
+        result = self.request_json('POST', '/share', {'fid_list': [fid], 'title': title, 'url_type': 1, 'expired_type': 1})
+        data = result.get('data') or {}
+        share_id = data.get('share_id') or ((data.get('task_resp') or {}).get('data') or {}).get('share_id')
+        if not share_id:
+            raise RuntimeError('分享创建成功但没有返回分享ID')
+        detail = self.request_json('POST', '/share/password', {'share_id': share_id})
+        d = detail.get('data') or {}
+        url = d.get('share_url')
+        if not url:
+            raise RuntimeError('没有获取到分享链接')
+        return url
 
     def _upload_parts(self, path, mime, info):
         bucket, obj_key, upload_id = info['bucket'], info['obj_key'], info['upload_id']
